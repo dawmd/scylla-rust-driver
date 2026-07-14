@@ -931,6 +931,7 @@ impl Connection {
             prepared.config.serial_consistency.flatten(),
             None,
             PagingState::start(),
+            None,
         )
         .await
     }
@@ -1043,6 +1044,7 @@ impl Connection {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_raw_with_consistency(
         &self,
         prepared_statement: &PreparedStatement,
@@ -1051,6 +1053,7 @@ impl Connection {
         serial_consistency: Option<SerialConsistency>,
         page_size: Option<PageSize>,
         paging_state: PagingState,
+        tablet_block_hint: Option<u8>,
     ) -> Result<QueryResponse, RequestAttemptError> {
         let get_timestamp_from_gen = || {
             self.config
@@ -1066,6 +1069,26 @@ impl Connection {
         let cached_metadata_params =
             self.calculate_cached_metadata_params(prepared_statement, &current_result_metadata);
 
+        // On a connection that negotiated TABLETS_ROUTING_V2 the server reads exactly one
+        // tablet-version block byte after the query parameters for every EXECUTE. Enforce
+        // that invariant here, at the single chokepoint through which all EXECUTE frames
+        // pass: always append a byte on V2 connections, and never append one otherwise. This
+        // mirrors how `result_metadata_id` is gated on `scylla_metadata_id_supported`, and
+        // keeps mixed-feature connections correct regardless of what the caller computed.
+        //
+        // The caller passes `None` when the request has no single partition to route by (a
+        // range scan, or a statement whose partition key we cannot compute). The server
+        // ignores the block for such a request and returns no routing information, so the
+        // byte's value is irrelevant and we send the cheapest one. That is why this fallback
+        // is `0` rather than the random probe the caller uses on a tablet-cache miss: there,
+        // the value matters (a mismatch is what makes the server send fresh routing
+        // information), so paying for randomness buys something. Here it would not.
+        let tablet_version_block = self
+            .features
+            .protocol_features
+            .tablets_v2_supported
+            .then(|| tablet_block_hint.unwrap_or(0));
+
         let execute_frame = execute::ExecuteV2 {
             id: prepared_statement.get_id().as_ref().into(),
             result_metadata_id: cached_metadata_params.result_metadata_id.map(Into::into),
@@ -1078,6 +1101,7 @@ impl Connection {
                 skip_metadata: cached_metadata_params.skip_metadata,
                 paging_state,
             },
+            tablet_version_block,
         };
 
         let query_response = self
