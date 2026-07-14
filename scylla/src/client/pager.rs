@@ -890,6 +890,7 @@ If you are using this API, you are probably doing something wrong."
                     serial_consistency,
                     Some(page_size),
                     paging_state,
+                    0,
                 )
                 .await
         };
@@ -971,6 +972,7 @@ If you are using this API, you are probably doing something wrong."
                                     serial_consistency,
                                     Some(page_size),
                                     paging_state,
+                                    0,
                                 )
                                 .await
                         };
@@ -1020,6 +1022,9 @@ If you are using this API, you are probably doing something wrong."
                         serial_consistency,
                         Some(page_size),
                         paging_state,
+                        // This API executes on one given connection and has no `ClusterState`
+                        // to consult, so there is no cached tablet version to probe.
+                        0,
                     )
                     .await
             },
