@@ -5,7 +5,9 @@ use std::time::Duration;
 use tracing::{Instrument as _, trace, trace_span};
 
 use crate::client::execution_profile::ExecutionProfileInner;
+use crate::cluster::ClusterState;
 use crate::errors::{RequestAttemptError, RequestError};
+use crate::frame::response::result::TableSpec;
 use crate::frame::types::{Consistency, SerialConsistency};
 
 use crate::network::Connection;
@@ -16,6 +18,8 @@ use crate::policies::load_balancing::{self, LoadBalancingPolicy, RoutingInfo};
 use crate::policies::retry::{RequestInfo, RetryDecision, RetryPolicy};
 use crate::policies::speculative_execution::{self, SpeculativeExecutionPolicy};
 use crate::response::{Coordinator, NonErrorQueryResponse};
+use crate::routing::Token;
+use crate::routing::locator::tablets::TabletVersion;
 use crate::statement::StatementConfig;
 use crate::{cluster::NodeRef, routing::Shard};
 
@@ -23,6 +27,30 @@ use crate::{cluster::NodeRef, routing::Shard};
 pub(crate) enum RunRequestResult<ResT> {
     IgnoredWriteError,
     Completed(ResT),
+}
+
+/// Chooses the `TABLETS_ROUTING_V2` tablet-version block to attach to an `EXECUTE`.
+///
+/// The block is a randomly chosen probe of the tablet version the driver has cached for the
+/// request's `(table, token)`, which the server uses to detect that the driver's routing cache
+/// went stale. It is chosen once per request rather than per attempt: re-rolling it on a retry
+/// (or, for a paged request, on a subsequent page) would gain nothing, since a single probe is
+/// already enough to detect any version change the server cares about.
+///
+/// Returns `None` when the request has no single partition to route by, in which case there is
+/// no tablet version to probe. Whether a byte is appended at all is decided per connection, by
+/// `Connection::execute_raw_with_consistency` (only V2 connections get one), so this is computed
+/// unconditionally here, without consulting the connection.
+pub(crate) fn choose_tablet_block_hint(
+    cluster_state: &ClusterState,
+    table_spec: Option<&TableSpec>,
+    token: Option<Token>,
+) -> Option<u8> {
+    let (table_spec, token) = table_spec.zip(token)?;
+    let version = cluster_state
+        .replica_locator()
+        .tablet_version_for_token(table_spec, token);
+    Some(TabletVersion::block_for(version))
 }
 
 /// Specifies the mechanism used for query paging.
