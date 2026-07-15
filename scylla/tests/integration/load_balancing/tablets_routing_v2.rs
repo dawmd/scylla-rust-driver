@@ -10,6 +10,7 @@
 //!   routing cache is warm the server stops returning `tablets-routing-v2` payloads;
 //! - a mixed cluster (one node without the extension) keeps both framings correct on their
 //!   respective connections;
+//! - leader-requiring requests to a strongly-consistent keyspace reach the tablet's Raft leader;
 //! - V1 still works when V2 is unavailable, since the two are mutually exclusive.
 //!
 //! The extension is experimental: the server only advertises it (on the wire under the name
@@ -19,11 +20,11 @@
 //! suite. The V1 test deliberately does not skip: it hides the extension from every node, so it
 //! exercises the V1 path either way.
 //!
-//! A tablet's routing can change under a running test -- it can migrate, changing its replica
-//! set -- which would make correct routing look wrong. Assertions that depend on where a request
-//! landed are therefore wrapped in [`with_migration_retry`], following the same approach as the
-//! tests in `tablets.rs`, and snapshot [`cached_tablet_routing`] to decide whether a failure was
-//! caused by such a change.
+//! A tablet's routing can change under a running test -- it can migrate, and a
+//! strongly-consistent tablet can elect a new Raft leader -- which would make correct routing
+//! look wrong. Assertions that depend on where a request landed are therefore wrapped in
+//! [`with_migration_retry`], following the same approach as the tests in `tablets.rs`, and
+//! snapshot [`cached_tablet_routing`] to decide whether a failure was caused by such a change.
 
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::routing::Shard;
 use scylla::serialize::row::SerializeRow;
+use scylla::statement::Consistency;
 use scylla::statement::prepared::PreparedStatement;
 use uuid::Uuid;
 
@@ -51,9 +53,9 @@ use scylla_proxy::{
 use tokio::sync::mpsc;
 
 use crate::utils::{
-    PerformDDL, execute_prepared_statement_everywhere, fetch_negotiated_features,
-    scylla_supports_tablets, setup_tracing, supports_feature, test_with_3_node_cluster,
-    unique_keyspace_name, with_migration_retry,
+    PerformDDL, create_new_session_builder, execute_prepared_statement_everywhere,
+    fetch_negotiated_features, scylla_supports_tablets, setup_tracing, supports_feature,
+    test_with_3_node_cluster, unique_keyspace_name, with_migration_retry,
 };
 
 /// The custom-payload key under which the server returns fresh V2 routing information.
@@ -72,8 +74,16 @@ const TABLETS_ROUTING_V2_EXTENSION: &str = "TABLETS_ROUTING_V2_EXPERIMENTAL";
 /// invalidates a measurement is precisely *the driver's view changing mid-flight* -- and that is
 /// what this observes directly.
 ///
-/// It changes whenever the driver learns a new mapping for the tablet, i.e. whenever the tablet
-/// migrated and its replica set moved.
+/// It changes whenever the driver learns a new mapping for the tablet, which covers both events
+/// that matter and which are largely independent of each other:
+///
+/// - the tablet migrated, changing its replica set;
+/// - a strongly-consistent tablet elected a new Raft leader. Note that a re-election alone is
+///   enough: the tablet version is a hash of the *ordered* replica list with the leader shifted
+///   to the front, so the version changes even though the replica set did not, and the server
+///   then hands the driver a freshly ordered list.
+///
+/// A server-side snapshot of the replica set would have caught only the first of those.
 async fn cached_tablet_routing(session: &Session, ks: &str, pk: i32) -> Vec<(Uuid, Shard)> {
     session
         .get_cluster_state()
@@ -520,6 +530,143 @@ async fn test_tablets_routing_v2_mixed_feature_connections() {
         Err(ProxyError::Worker(WorkerError::DriverDisconnected(_))) => (),
         Err(err) => panic!("{}", err),
     }
+}
+
+// -- strongly-consistent (leader-aware) routing -----------------------------
+
+/// Creates a strongly-consistent (Raft-based) keyspace and a single-partition table.
+///
+/// The `consistency = 'global'` clause is what the driver reads from
+/// `system_schema.scylla_keyspaces` and exposes as [`ConsistencyMode::Global`] on
+/// [`Keyspace::consistency_mode`], and it is what makes the load balancing policy route the
+/// table's requests to the tablet leader.
+async fn create_strongly_consistent_tablet_table(session: &Session, ks: &str) {
+    let supports_table_tablet_options = supports_feature(session, "TABLET_OPTIONS").await;
+    let (ks_tablet_opts, table_tablet_opts) = if supports_table_tablet_options {
+        (
+            "AND tablets = { 'enabled': true }".to_string(),
+            "WITH tablets = { 'min_tablet_count': 8 }".to_string(),
+        )
+    } else {
+        ("AND tablets = { 'initial': 8 }".to_string(), String::new())
+    };
+
+    session
+        .ddl(format!(
+            "CREATE KEYSPACE IF NOT EXISTS {ks} WITH REPLICATION = \
+             {{'class': 'NetworkTopologyStrategy', 'replication_factor': 2}} \
+             {ks_tablet_opts} AND consistency = 'global'"
+        ))
+        .await
+        .unwrap();
+    session
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {ks}.t (pk int PRIMARY KEY, v int) {table_tablet_opts}"
+        ))
+        .await
+        .unwrap();
+}
+
+/// For a strongly-consistent (Raft-based) keyspace the server orders each tablet's replica list
+/// with the Raft leader first, so once the mapping is cached every leader-requiring request (here
+/// a `LOCAL_QUORUM` read) must be coordinated by `replicas[0]`, saving the extra
+/// coordinator->leader hop.
+///
+/// This also covers, indirectly, that the driver discovered the keyspace's consistency mode from
+/// `system_schema.scylla_keyspaces` at all: leader-aware routing only engages for a keyspace the
+/// driver believes is strongly consistent, so a mode that failed to be read would show up here as
+/// requests spreading across replicas. The mode itself is crate-private, and the mapping from the
+/// raw `consistency` column value to it is unit-tested next to the code that does it.
+///
+/// A read at `ONE`/`LOCAL_ONE` is intentionally *not* pinned to the leader (any single replica
+/// satisfies it); that carve-out is covered by the policy unit tests.
+#[tokio::test]
+async fn test_leader_aware_routing_targets_the_raft_leader() {
+    setup_tracing();
+
+    let features = fetch_negotiated_features(None).await;
+    if !features.tablets_v2_supported {
+        tracing::warn!(
+            "Skipping test because the server did not negotiate TABLETS_ROUTING_V2_EXPERIMENTAL"
+        );
+        return;
+    }
+
+    let session: Session = create_new_session_builder().build().await.unwrap();
+    if !scylla_supports_tablets(&session).await {
+        tracing::warn!("Skipping test because this Scylla version doesn't support tablets");
+        return;
+    }
+
+    let sc_ks = unique_keyspace_name();
+    create_strongly_consistent_tablet_table(&session, &sc_ks).await;
+
+    {
+        // A single fixed partition key, so every request targets the same tablet.
+        const PK: i32 = 2;
+
+        // Writes to a strongly-consistent (Raft) table are rejected unless they use
+        // QUORUM/LOCAL_QUORUM, so pin the insert to LOCAL_QUORUM.
+        let mut insert = session
+            .prepare(format!("INSERT INTO {sc_ks}.t (pk, v) VALUES (?, ?)"))
+            .await
+            .unwrap();
+        insert.set_consistency(Consistency::LocalQuorum);
+        session.execute_unpaged(&insert, (PK, 1)).await.unwrap();
+
+        // A strong read (LOCAL_QUORUM) is a leader-requiring request.
+        let mut select = session
+            .prepare(format!("SELECT v FROM {sc_ks}.t WHERE pk = ?"))
+            .await
+            .unwrap();
+        select.set_consistency(Consistency::LocalQuorum);
+
+        // Warm the V2 routing cache for this tablet, once. On a cold start the driver sends a
+        // random tablet-version block that almost always mismatches, so the server returns the
+        // routing payload and the driver caches the leader-first replica list. Leader-aware
+        // routing then targets `replicas[0]`, which is what makes the leader observable as the
+        // coordinator below.
+        const WARMUP: usize = 32;
+        execute_concurrently(&session, &select, &(PK,), WARMUP)
+            .await
+            .unwrap();
+
+        // Either a migration or a Raft re-election can change which replica the driver considers
+        // the leader while the batch below is in flight, failing the check through no fault of
+        // the driver. Snapshotting the driver's own routing view catches both, and the attempt
+        // reads the leader out of that very snapshot, so the expectation and the check can never
+        // disagree about which mapping they are talking about.
+        with_migration_retry(
+            async || cached_tablet_routing(&session, &sc_ks, PK).await,
+            async |routing| {
+                // The server sends the replica list leader-first, so the leader is replicas[0]
+                // of the mapping the driver holds right now.
+                let leader = routing
+                    .first()
+                    .ok_or_else(|| "strongly-consistent tablet has no replicas".to_owned())?
+                    .0;
+
+                // With the cache warm, every strong read for this tablet must be coordinated by
+                // the leader.
+                const ITERATIONS: usize = 20;
+                let coordinators =
+                    execute_concurrently(&session, &select, &(PK,), ITERATIONS).await?;
+                if let Some(other) = coordinators.iter().find(|c| **c != leader) {
+                    return Err(format!(
+                        "strong read coordinated by {other} but the Raft leader is \
+                         replicas[0]={leader}; leader-aware routing did not target the leader"
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .await;
+    }
+
+    session
+        .ddl(format!("DROP KEYSPACE IF EXISTS {sc_ks}"))
+        .await
+        .unwrap();
 }
 
 /// `TABLETS_ROUTING_V1` must keep working on a server that does not offer V2.
