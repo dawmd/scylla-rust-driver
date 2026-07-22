@@ -1759,6 +1759,8 @@ impl Session {
 
         let table_spec = prepared.get_table_spec();
 
+        let cluster_state = self.get_cluster_state();
+
         let routing_info = RoutingInfo {
             consistency: exec_params.consistency,
             serial_consistency,
@@ -1774,7 +1776,6 @@ impl Session {
             serialized_values.buffer_size(),
         );
 
-        let cluster_state = self.get_cluster_state();
         if !span.span().is_disabled()
             && let (Some(table_spec), Some(token)) = (routing_info.table, token)
         {
