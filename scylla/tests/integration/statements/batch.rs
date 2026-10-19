@@ -659,3 +659,143 @@ async fn test_batch_to_multiple_tables() {
 
     session.ddl(format!("DROP KEYSPACE {ks}")).await.unwrap();
 }
+
+// A batch can be prepared as a whole, as a single `BEGIN BATCH ... APPLY BATCH` statement.
+// Then, bind indexes are global to the batch, and the server computes the indexes of the markers
+// that bind the partition key by looking at all the statements of the batch.
+// The token is known only if all statements target the same table and the partition key
+// is fully bound by markers, regardless of which statements those markers come from.
+#[tokio::test]
+async fn test_prepared_batch_token() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let ks = unique_keyspace_name();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {ks} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}")).await.unwrap();
+    session.use_keyspace(&ks, false).await.unwrap();
+    for table in ["batch_token_test1", "batch_token_test2"] {
+        session
+            .ddl(format!(
+                "CREATE TABLE IF NOT EXISTS {table} (p int PRIMARY KEY, val int)"
+            ))
+            .await
+            .unwrap();
+    }
+    session
+        .ddl("CREATE TABLE IF NOT EXISTS batch_composite_pk_test (pk1 int, pk2 int, val int, PRIMARY KEY ((pk1, pk2)))")
+        .await
+        .unwrap();
+
+    // Case 1: the partition key is bound by markers in a single table. The token is known.
+    {
+        let prepared = session
+            .prepare(
+                "BEGIN BATCH \
+                 INSERT INTO batch_token_test1 (p, val) VALUES (?, ?); \
+                 INSERT INTO batch_token_test1 (p, val) VALUES (30, ?); \
+                 APPLY BATCH",
+            )
+            .await
+            .unwrap();
+        let values = (1, 2, 3);
+        session.execute_unpaged(&prepared, values).await.unwrap();
+
+        let single_stmt = session
+            .prepare("INSERT INTO batch_token_test1 (p, val) VALUES (?, ?)")
+            .await
+            .unwrap();
+        let expected = single_stmt.calculate_token(&(1, 0)).unwrap().unwrap();
+        assert_eq!(prepared.calculate_token(&values).unwrap(), Some(expected));
+    }
+
+    // Case 2: the partition key is hardcoded, so it is not bound by a marker.
+    // The token is unknown.
+    {
+        let prepared = session
+            .prepare(
+                "BEGIN BATCH \
+                 INSERT INTO batch_token_test1 (p, val) VALUES (1, ?); \
+                 APPLY BATCH",
+            )
+            .await
+            .unwrap();
+        let values = (2,);
+        session.execute_unpaged(&prepared, values).await.unwrap();
+        assert_eq!(prepared.calculate_token(&values).unwrap(), None);
+    }
+
+    // Case 3: the statements target different tables. The token is unknown,
+    // even though each statement binds its partition key.
+    {
+        let prepared = session
+            .prepare(
+                "BEGIN BATCH \
+                 INSERT INTO batch_token_test1 (p, val) VALUES (?, ?); \
+                 INSERT INTO batch_token_test2 (p, val) VALUES (?, ?); \
+                 APPLY BATCH",
+            )
+            .await
+            .unwrap();
+        let values = (1, 2, 3, 4);
+        session.execute_unpaged(&prepared, values).await.unwrap();
+        assert_eq!(prepared.calculate_token(&values).unwrap(), None);
+    }
+
+    // Used to compute the expected tokens.
+    let single_stmt = session
+        .prepare("INSERT INTO batch_composite_pk_test (pk1, pk2, val) VALUES (?, ?, ?)")
+        .await
+        .unwrap();
+
+    // Case 1: no single statement binds the whole partition key, but together they do.
+    // Bind indexes: 0 -> pk1, 1 -> val (1st statement); 2 -> pk2, 3 -> val (2nd statement).
+    {
+        let prepared = session
+            .prepare(
+                "BEGIN BATCH \
+                 INSERT INTO batch_composite_pk_test (pk1, pk2, val) VALUES (?, 10, ?); \
+                 INSERT INTO batch_composite_pk_test (pk1, pk2, val) VALUES (20, ?, ?); \
+                 APPLY BATCH",
+            )
+            .await
+            .unwrap();
+        let values = (1, 2, 3, 4);
+        session.execute_unpaged(&prepared, values).await.unwrap();
+
+        // pk1 comes from bind index 0, pk2 from bind index 2.
+        let expected = single_stmt.calculate_token(&(1, 3, 0)).unwrap().unwrap();
+        assert_eq!(prepared.calculate_token(&values).unwrap(), Some(expected));
+    }
+
+    // Case 2: both statements bind pk1, so the last bind index wins for it.
+    // Bind indexes: 0 -> pk1, 1 -> pk2, 2 -> val (1st statement); 3 -> val, 4 -> pk1 (2nd statement).
+    // pk1 corresponds to the marker of the 2nd statement, pk2 to the marker of the 1st one.
+    {
+        let prepared = session
+            .prepare(
+                "BEGIN BATCH \
+                 INSERT INTO batch_composite_pk_test (pk1, pk2, val) VALUES (?, ?, ?); \
+                 UPDATE batch_composite_pk_test SET val = ? WHERE pk1 = ? AND pk2 = 10; \
+                 APPLY BATCH",
+            )
+            .await
+            .unwrap();
+        let values = (1, 2, 3, 4, 5);
+        session.execute_unpaged(&prepared, values).await.unwrap();
+
+        // pk1 comes from bind index 4, pk2 from bind index 1.
+        let expected = single_stmt.calculate_token(&(5, 2, 0)).unwrap().unwrap();
+        let unexpected1 = single_stmt.calculate_token(&(1, 2, 0)).unwrap().unwrap();
+        let unexpected2 = single_stmt.calculate_token(&(5, 10, 0)).unwrap().unwrap();
+        assert_eq!(prepared.calculate_token(&values).unwrap(), Some(expected));
+        assert_ne!(
+            prepared.calculate_token(&values).unwrap(),
+            Some(unexpected1)
+        );
+        assert_ne!(
+            prepared.calculate_token(&values).unwrap(),
+            Some(unexpected2)
+        );
+    }
+
+    session.ddl(format!("DROP KEYSPACE {ks}")).await.unwrap();
+}
